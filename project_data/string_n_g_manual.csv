@@ -1,0 +1,11 @@
+#category,term ID,term description,observed gene count,background gene count,strength,false discovery rate
+STRING clusters,CL:4849,"Mitotic Spindle Checkpoint, and mitotic nuclear division",20,148,0.94,0.00000000761
+Reactome,HSA-69618,Mitotic Spindle Checkpoint,17,108,1,0.0000000202
+Reactome,HSA-141444,Amplification  of signal from unattached  kinetochores,15,92,1.02,0.00000011
+Reactome,HSA-5663220,RHO GTPases Activate Formins,17,136,0.9,0.000000132
+COMPARTMENTS,GOCC:0043226,Organelle,211,9848,0.14,0.000000159
+Reactome,HSA-195258,RHO GTPase Effectors,23,289,0.71,0.000000298
+Reactome,HSA-9648025,EML4 and NUDC in mitotic spindle formation,15,113,0.93,0.000000483
+STRING clusters,CL:4854,"Mixed, incl. condensed chromosome and centromeric region.",15,102,0.97,0.000000562
+Reactome,HSA-2500257,Resolution of Sister Chromatid Cohesion,15,122,0.89,0.00000107
+Reactome,HSA-68882,Mitotic Anaphase,19,227,0.73,0.00000277

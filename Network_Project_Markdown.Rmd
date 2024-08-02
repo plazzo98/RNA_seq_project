@@ -1,0 +1,1066 @@
+---
+title: "ADA_project_Markdown"
+date: "2023-04-14"
+author: 'Plazzotta Giovanni, MAT. 232312'
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning=FALSE,
+                      message=FALSE,
+                      tidy.opts=list(width.cutoff = 80),
+                      tidy = TRUE)
+```
+
+## SETTING UP
+
+```{r, echo=FALSE}
+library("recount3")
+suppressPackageStartupMessages(library("recount3"))
+
+setwd("/home/giovanni/Desktop/Statistical_Learning")
+
+human_projects <- available_projects()
+proj_info <- subset(
+  human_projects,
+  project == "SRP145599" & project_type == "data_sources"
+)
+
+# Create a RangedSummarizedExperiment (RSE) object at the gene level
+
+rse_gene_SRP145599 <- create_rse(proj_info)
+raw_coverage_counts <- as.data.frame(assay(rse_gene_SRP145599))
+
+# The RSE object contains "raw transcript coverage counts", computed as the sum of the base coverage of each base in the transcript (see
+# 'https://f1000research.com/articles/6-1558/v1', chapter 'Coverage counts provided by recount2'). These raw coverage counts are different 
+# from read counts. This is an important difference to keep in mind as most methods were developed for read count matrices. Since part of 
+# the sample metadata downloaded with the script above include the read length and number of mapped reads, the "raw transcript coverage 
+# counts" in recount3 can be scaled to "read counts" using the transform_counts() function. 
+
+read_counts <- transform_counts(rse_gene_SRP145599)
+read_counts <- as.data.frame(read_counts)
+
+# From now on, I will work with read_counts as my main dataset. It is important to notice that this dataframe may need normalization. 
+
+gene_info <- as.data.frame(rowRanges(rse_gene_SRP145599))                                   # Information about each transcript
+head(gene_info)
+
+```
+
+## Reordering with respect to Labels
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# ADD METADATA: I want to be able to have the naive samples in the first section, the samples conditioned with IFNb in the second and 
+# samples conditioned with IFNg in the third. I have prepared metadata in a separate csv. The ordering of samples from the metadata 
+# csv and the dataframe is not the same. I start by adding a row to the database, which is the conditioning of the corresponding sample. 
+# This is not easy because samples in the metadata and in the dataframe have not the same ordering, plus samples belonging to different 
+# groups are all mixed together. 
+
+meta <- read.csv("important_metadata_mod_minimal.csv")
+
+# Let's add to the dataframe in its current form (dataf) an additional row, that will be populated by the labels. I create a new variable, dataf_label, 
+# for this version of the dataframe.
+
+dataf_label <- read_counts
+dataf_label[nrow(dataf_label) + 1, ] <- rep(0,133)
+row.names(dataf_label)[row.names(dataf_label) == "63857"] <- "label"
+
+# Now I have to fill the last row with the labels. I can get them from the metadata, with all the difficulties we already discussed.
+
+for (i in seq(1,133, by = 1)) {
+  for (j in seq(1,133, by = 1)) {
+    if (names(dataf_label)[i] == meta[j, 1]) {
+      dataf_label[63857, i] <- meta[j,2]
+    }
+  }
+}
+
+# Now I want to split the dataset into three subdatasets, one for each conditioning
+
+subdata_naive <- dataf_label[, dataf_label[63857, ] == 'Naive']
+head(subdata_naive)
+subdata_IFNb <- dataf_label[, dataf_label[63857, ] == 'IFNb']
+head(subdata_IFNb)
+subdata_IFNg <- dataf_label[, dataf_label[63857, ] == 'IFNg']
+head(subdata_IFNg)
+
+# Now I want to join these three datasets together, in order to have the first naive samples, then the IFNb samples, then the IFNg samples
+
+dataf_glued <- cbind(subdata_naive, subdata_IFNb, subdata_IFNg)
+View(dataf_glued)
+
+# Before removing the labels, we want to be able to remember when does each group end.
+
+index_naive <- which(dataf_glued[63857, ] == 'Naive')
+index_naive                                              # Naive ends at column 59
+length(index_naive)                                      # 59 samples
+index_IFNb <- which(dataf_glued[63857, ] == 'IFNb')
+index_IFNb                                               # INFb ends at column 92
+length(index_IFNb)                                       # 33 samples
+index_IFNg <- which(dataf_glued[63857, ] == 'IFNg')
+index_IFNg                                               # INFg ends at column 92
+length(index_IFNg)                                       # 41 samples
+
+# Now we can remove the labels row, since we know that the first 59 samples are naive, the second 33 IFNb, the third 41 INFg
+
+dataf_unlabelled <- dataf_glued[1:63856, ]
+
+# To prepare the dataframe for further analysis, we need to convert all characters to numeric
+
+dataf_unlabelled[] <- lapply(dataf_unlabelled, as.numeric)
+dim(dataf_unlabelled)
+
+```
+
+## Filtering
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# We look for NAs, zero values, values in between 0 and 1.
+
+length(which(is.na(dataf_unlabelled)))                                 # No NAs
+length(which(dataf_unlabelled > 0 & dataf_unlabelled < 1))             # No numbers between 0 and 1
+length(which(dataf_unlabelled == 0))                                   # Lot of zeroes
+length(which(dataf_unlabelled != 0))
+dim(dataf_unlabelled)                           # Perfect, if we sum the number of zero and non zero entries we obtain the full dataframe: no NAs!
+
+# A lot of zero entries or entries with very low expression values. Let's delete the rows of the dataset such that more than half 
+# the entries in the row is zero. Since I have 133 columns, I will delete the row if more than 70 entries are == 0 in that line. 
+# I can do this with a for loop, reported below, but it's extremely slow. An alternative approach is to use the genefilter library,
+# that allows to choose the proportion of entries that must be 0 in order # for a row to be deleted. 
+
+# to_delete_row_indexes <- c()
+
+# for (i in seq(1,63856, by = 1)) {
+  
+#  if (sum(dataf_unlabelled[i, ] == 0) > 70) {
+    
+#    to_delete_row_indexes <- append(to_delete_row_indexes, i)
+    
+#  }
+  
+# }
+
+# length(to_delete_row_indexes)
+
+# dataf_nonzero <- dataf_unlabelled[-to_delete_row_indexes, ]
+
+suppressPackageStartupMessages(library("genefilter"))
+filtering_function <- filterfun(pOverA(0.5,0.0))
+rows_to_retain <- genefilter(dataf_unlabelled, filtering_function)
+dataf_nonzero <- dataf_unlabelled[rows_to_retain, ]
+dim(dataf_nonzero)
+
+```
+
+## Pre - Normalization Data Visualization
+
+```{r, echo=FALSE, fig.width=9, fig.height=8.5, fig.align="center"}
+
+suppressWarnings(boxplot(dataf_nonzero))                                    # Seems to be needing log transform
+suppressWarnings(boxplot(log(dataf_nonzero)))                               # Already better, but in obvious need of normalization
+
+```
+
+## Normalization
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# EdgeR was used for normalization of RNA seq data. It can be used to normalize for sequencing depth, RNA composition and gene 
+# length, so it is effective for both within sample and between samples comparisons (and so for differential expression analysis). 
+
+suppressPackageStartupMessages(library("edgeR"))
+suppressPackageStartupMessages(library("dplyr"))
+
+total_gene_length <- gene_info["bp_length"]                           
+
+# Dataframes of gene lengths. Dataf_nonzero has lost some of these rows due to the elimination of zero entries, so if I want to retain 
+# only the length of the genes in datf_nonzero, I need to merge in some way the two datasets.
+
+multilist <- list(dataf_nonzero, total_gene_length)                   
+idx <- Reduce(intersect, lapply(multilist, rownames))
+current_gene_length <- data.frame(total_gene_length[idx, ], row.names = rownames(dataf_nonzero))  
+
+# Now this is a dataframe, with row names and column names, but I only care of the values.
+
+current_gene_length <- current_gene_length$total_gene_length.idx...       # I extract the first and only column in order to get a vector
+current_gene_length <- as.numeric(current_gene_length)
+length(current_gene_length)
+dim(dataf_nonzero)                                                        # Ok, they should have same length and they do
+
+```
+
+```{r, echo=FALSE, fig.width=9, fig.height=8.5, fig.align="center"}
+
+# Calculate RPK for each gene --> raw read counts/length gene in kilobases. So we need to multiply the numerator for 1000. 
+# The raw read counts are still contained in the dataf_nonzero dataframe. In order to do this, we need to divide the values
+# in each row for the value in the row of current_gene_length with the same name. 
+
+dataf_nonzero_multiplied <- 1000*dataf_nonzero
+rpk_dataf <- dataf_nonzero_multiplied                                 # Dataframe normalized for gene length
+rpk_dataf_matrix <- as.matrix(rpk_dataf)
+rpk_dataf_matrix <- sweep(rpk_dataf_matrix, 1, current_gene_length, "/")  # Sweep is way faster than the for loop I coded below, but requires matrix conversion
+
+rpk_dataf <- as.data.frame(rpk_dataf_matrix)
+
+#for (i in seq (1,24991)) {
+  
+#  rpk_dataf[i, ] <- (dataf_nonzero_multiplied[i, ] / current_gene_length[i,1])     # This is the old for loop I built for this. Extremely slow. 
+  
+#}
+
+dim(rpk_dataf)                                                       # Dimensions should not have changed, and have not
+group <- c(rep("A",133))                                             # No grouping of samples
+rpk.norm <- DGEList(counts=rpk_dataf, group=group)
+rpk.norm <- calcNormFactors(rpk.norm)
+counts_GeTMM <- as.data.frame(cpm(rpk.norm))                         
+suppressWarnings(boxplot(counts_GeTMM))             # The data clearly need a log transformation
+counts_GeTMM <- counts_GeTMM + 1            # Log transformation would project to minus infinite all zero values: we add 1 to ALL entries to avoid this. 
+
+log_counts_GeTMM <- log2(counts_GeTMM)
+suppressWarnings(boxplot(log_counts_GeTMM))         # Pretty good result!
+
+# From now on, I will use log_counts_GeTMM as my normalized and log-transformed dataframe, for all the analysis that will follow. 
+
+dataf_final <- as.data.frame(log_counts_GeTMM)
+dim(dataf_final)
+
+# Just a final touch: let's round all numbers up to the third decimal. 
+
+dataf_final <- signif(dataf_final, 4)
+
+```
+
+## Dimensionality Reduction - PCA
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+library("GEOquery")
+
+set.seed(10)
+
+pca <- prcomp(t(dataf_final))                                    # PCA works with the transpose of our dataframe
+screeplot(pca)
+importance_df <- as.data.frame(summary(pca)['importance'])
+importance_df_10_pov <- importance_df[2, 1:10]
+plot(c(seq(1:10)), importance_df_10_pov[1, ], type = 'b', xlab = 'Component', ylab = 'Proportion of Variance')
+cumulative_df_10_pov <- importance_df[3, 1:10]
+plot(c(seq(1:10)), cumulative_df_10_pov[1, ], type = 'b', xlab = 'Component', ylab = 'Cumulative Proportion of Variance')
+
+grpcol <- c(rep("red",59), rep("blue",33), rep("green",41))
+plot(pca$x[,1], pca$x[,2], xlab="PCA1", ylab="PCA2", main="PCA for components 1&2", type="p", pch=10, col=grpcol)
+text(pca$x[,1], pca$x[,2], rownames(pca$x), cex=0.75)
+
+grpcol <- c(rep("red",59), rep("blue",33), rep("green",41))                                                        # Without sample names
+plot(pca$x[,1], pca$x[,2], xlab="PCA1", ylab="PCA2", main="PCA for components 1&2", type="p", pch=10, col=grpcol)
+
+# I have colored the samples depending on their belonging to each particular group, by exploiting the fact that the samples 
+# belonging to each group are ordered in the dataframe now. So from the PCA plot we are not getting predictions, we are simply 
+# observing our data with their labels. While we can clearly identify the cluster of IFNg samples, it is difficult to disentangle 
+# the cluster of naive and IFNb samples. 
+
+```
+
+## Unsupervised Learning: K - Means
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+library("useful")
+
+k <- 3
+
+set.seed(10)
+kmeans_result <- kmeans(t(dataf_final), k)
+table(kmeans_result$cluster)                   # From the labels, we know that there should be 59 naive sample, 33 INFb samples and 41 IFNg samples
+plot(kmeans_result, data=t(dataf_final)) + geom_text(aes(label=colnames(dataf_final)),hjust=0,vjust=0)
+plot(kmeans_result, data=t(dataf_final))
+
+# From the K Means PCA, we can see how it was pretty good at identifying the cluster of IFNg samples, but by comparing the PCA 
+# plot with the PCA plot of K Means, we can see that the division betwen naive and IFNb samples was done in an incorrect way. 
+# We can explicitly compute the performance of K Means on the training data (since we only have training data as of now) by 
+# feeding the function table with the real labels. 
+
+labels = c(rep("1",59), rep("2",33), rep("3",41))            # I use numeric labels because kmeans generates numeric ones. 
+table(kmeans_result$cluster, labels)
+
+# We can see that k Means is indeed able to perfectly identify the IFNg cluster, with zero missclassification, but performs 
+# poorely on the other two clusters, because it hallucinates a boundary between the naive and IFNb datapoints which is incorrect when compared with the PCA above.
+# In particular, if we consider only group 1 (naive) and 2 (IFNb), K - Means shows the following values for sensitivity,specificity, 
+# accuracy and error rate:
+
+# Rand Index
+
+mclust::adjustedRandIndex(labels, kmeans_result$cluster)
+
+```
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+sens_km <- sum(kmeans_result$cluster == 1 & labels == 1) / (sum(kmeans_result$cluster == 1 & labels == 1) + sum(kmeans_result$cluster == 2 & labels == 1))
+sens_km
+spec_km <- sum(kmeans_result$cluster == 2 & labels == 2) / (sum(kmeans_result$cluster == 1 & labels == 2) + sum(kmeans_result$cluster == 2 & labels == 2))
+spec_km
+acc_km <- (sum(kmeans_result$cluster == 2 & labels == 2) + sum(kmeans_result$cluster == 1 & labels == 1)) / 92  
+
+# 92 is the total sum of entires, if we consider only group 1 and 2
+
+acc_km
+err_rate_km <- 1 - acc_km
+err_rate_km
+
+# Not good statistics at all if we consider only group 1 and 2
+
+```
+
+## Unsupervised Learning: Hierarchical Clustering
+
+```{r, echo=FALSE, fig.width=25, fig.height=15, fig.align="center"}
+
+set.seed(10)
+
+dist_matrix <- dist(t(dataf_final))
+hc_result <- hclust(dist_matrix, method = "ave")
+k <- 3
+
+hc_groups <- cutree(hc_result, k=k)                     # From the labels, we know that there should be 59 naive sample, 33 INFb samples and 41 IFNg samples
+labels = c(rep("1",59), rep("2",33), rep("3",41))       # These are the labels. I use numeric labels because kmeans generates numeric ones. 
+table(hc_groups)                                        # This is the division generated by HC
+
+# We notice that the division generated by HC is not the same as our data labels: this means that there are some missclassification. We notice that 
+# the cardinality of the third set is the only one being correct, so HC was successful at clustering together samples belonging to IFNg
+
+plot(hc_result, hang <- 0.5, labels=hc_groups)
+rect.hclust(hc_result, k = 3, which = NULL, x = NULL, h = NULL, border = 2, cluster = NULL)
+plot(hc_result, hang <- 0.5, labels=labels)
+rect.hclust(hc_result, k = 3, which = NULL, x = NULL, h = NULL, border = 2, cluster = NULL)
+
+# HC does not allow for a fast graphic comparison, like we did between PCA and K Means. So if we want to discuss the performance 
+# of HC on the training data, the sole strategy we have is to feed the function table with the real labels.
+
+table(hc_groups, labels)
+
+# We notice that the results on IFNg are flawless, exactly like we saw for K Means. Additionally, if we consider only group 1 (naive) 
+# and 2 (IFNb), HC shows the following values for sensitivity, specificity, accuracy and error rate:
+
+
+# Rand Index
+
+mclust::adjustedRandIndex(labels, cutree(hc_result, k=3))
+
+
+```
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+sens_hc <- sum(hc_groups == 1 & labels == 1) / (sum(hc_groups == 1 & labels == 1) + sum(hc_groups == 2 & labels == 1))
+sens_hc
+spec_hc <- sum(hc_groups == 2 & labels == 2) / (sum(hc_groups == 1 & labels == 2) + sum(hc_groups == 2 & labels == 2))
+spec_hc
+acc_hc <- (sum(hc_groups == 2 & labels == 2) + sum(hc_groups == 1 & labels == 1)) / 92  # 92 is the total sum of entries, if we consider only group 1 and 2
+acc_hc
+err_rate_hc <- 1 - acc_hc
+err_rate_hc
+
+# Not good statistics at all if we consider only group 1 and 2
+
+```
+
+## Features Selection: t - Test
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# Feature selection can be performed with a row wise t - Test. The t - Test is able to compare two groups of samples per time: 
+# since I want to compare naive to IFNb, naive to IFNg and IFNb to IFNg, I will need to create 3 different dataframes, each 
+# with only the samples of the groups that I want to compare. I also need to feed each time the t test with the labels, in
+# order for it to known which samples belong to which group. 
+
+library("genefilter")
+
+data_naive_b <- dataf_final[, 1:92] # Column from 1 to 59 (59 samples) are naive, from 60 to 92 (33 samples) IFNb, form 93 to 133 (41 samples) IFNg 
+dim(data_naive_b)
+class(data_naive_b)
+data_naive_g <- cbind(dataf_final[, 1:59], dataf_final[, 93:133])
+dim(data_naive_g)
+data_b_g <- dataf_final[, 60:133]
+dim(data_b_g)
+
+# Now I need to create the labels for the t - Test:
+
+label_naive_b <- factor(c(rep("Naive",59), rep("IFNb",33)))
+label_naive_g <- factor(c(rep("Naive",59), rep("IFNg",41)))
+label_b_g <- factor(c(rep("IFNb",33), rep("IFNg",41)))
+
+# The t - Test requires the data in matrix form, not dataframe, so I need to convert the dataframes I initialized above.
+
+data_naive_b <- as.matrix(data_naive_b)
+class(data_naive_b)                                                    # Just to check the conversion actually happened
+data_naive_g <- as.matrix(data_naive_g)
+data_b_g <- as.matrix(data_b_g)
+
+# Now the t - Tests:
+
+tt_naive_b <- genefilter::rowttests(data_naive_b, label_naive_b)
+tt_naive_g <- genefilter::rowttests(data_naive_g, label_naive_g)
+tt_b_g <- genefilter::rowttests(data_b_g, label_b_g)
+
+dim(tt_naive_b)
+dim(tt_naive_g)
+dim(tt_b_g)
+
+# The t - Test produced, for each of the tree call, a dataframe with three statistics for each transcript. The third one is the p value.
+# I asked for the dimensions because I expect all three fo them to have the same dimensions, in particular the same length. 
+
+# Now we can convert the matrices into dataframes again:
+
+data_naive_b <- as.data.frame(data_naive_b)
+class(data_naive_b)                                                    # Just to check the conversion actually happened
+data_naive_g <- as.data.frame(data_naive_g)
+data_b_g <- as.data.frame(data_b_g)
+
+```
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# Now we want to extract, from each tt dataframe, only those rows (transcripts) that are associated with a pretty low p value (so rows
+# whose expression levels has a significant difference across the two groups compared), in order to identify the most important features. 
+# Since we have applied a t - test many times, some of these times we could have gotten significant results just by chance. To correct for 
+# this, we can apply the function p.adjust before the selection. 
+
+tt_naive_b_keepers_indexes <- which(p.adjust(tt_naive_b$p.value) < 0.000000001)     # Original: 0.001
+length(tt_naive_b_keepers_indexes)
+tt_naive_g_keepers_indexes <- which(p.adjust(tt_naive_g$p.value) < 0.000000001)     # I'm using a more stringent threshold for the p value w. respect to the slides
+length(tt_naive_g_keepers_indexes)
+tt_b_g_keepers_indexes <- which(p.adjust(tt_b_g$p.value) < 0.000000001)
+length(tt_b_g_keepers_indexes)
+
+# I have obtained three lists of genes (actually, of indexes) whose expression changes significantly between naive and IFNb, naive 
+# and IFNg, IFNb and IFNg. The most interesting comparison is between naive and IFNb and naive and IFNg, so from now on I will be working with
+# those two. I can extract, from the datasets data_naive_b and data_naive_g created above, only the rows that matter, using the indexing created
+# above. 
+
+selected_naive_b <- data_naive_b[tt_naive_b_keepers_indexes, ]
+selected_naive_g <- data_naive_g[tt_naive_g_keepers_indexes, ]
+dim(selected_naive_b)
+dim(selected_naive_g)
+
+# From now on, we will perform each analysis on both these dataframes. 
+
+```
+
+## Supervised Learning: Random Forest
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+################ selected_naive_b: Random Forest preprocessing ##########################
+
+# I need to put this dataframe in the right shape: I need to transpose it (so to have the predictors on the columns) and to add an additional column,
+# containing the labels
+
+library("randomForest")
+library("caret")
+set.seed(1)
+selected_naive_b_trasposed <- t(selected_naive_b)
+dim(selected_naive_b_trasposed)                                                                  # Ok, it has been transposed
+labels_n_b <- factor(c(rep("Naive",59), rep("IFNb",33)))
+labelled_selected_naive_b_trasposed <- cbind(as.data.frame(selected_naive_b_trasposed), labels_n_b)                # The last column is the label column!
+colnames(labelled_selected_naive_b_trasposed)[ncol(labelled_selected_naive_b_trasposed)] <- "labels_column_n_b"
+dim(labelled_selected_naive_b_trasposed)                                                                           # In fact there is an additional column
+
+####################### selected_naive_b: Random Forest whole dataset fit #####################################
+
+# In random forest we should choose ntree and mtry by CV, but we were instructed to use the default value for mtry. A value of ntree = 50 was decided by me, in order for the function to generate a decent plot of the error in function of the number of trees. So we can consider the parameter selection step done and fit the best model on the whole dataset. 
+
+library("randomForest")
+set.seed(1)
+rf_naive_b <- randomForest(labels_column_n_b ~., data = labelled_selected_naive_b_trasposed, ntree = 50)
+rf_naive_b
+plot(rf_naive_b, main = "naive - IFN beta")
+plot(sort(rf_naive_b$importance, decreasing=TRUE))
+
+################ selected_naive_b: Random Forest multi CV run ##########################
+
+# We now wish to get an estimation the performance of the method, in order to being able to compare it to the others. We can do such by computing a cross validation error. This cross validation error will be actually computed multiple (10) times, in order to be able to compute mean and standard deviations of these cross validation errors. It is important to notice that while this cross validation explores internally different values for the parameters, it is not used for parameter selection, but only for general model evaluation. Parameter selection must be performed separately, and as discussed above, in the random forest case it is not necessary. The repeated cross validation loops internally across mtry, not across ntree, so we can just fix ntree. 
+
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 10, savePredictions = TRUE)
+metric <- "Accuracy"
+final_random_forest_cv_n_b <- train(labels_column_n_b ~., data=labelled_selected_naive_b_trasposed, method="rf", ntree = 50, metric=metric, trControl=control)
+final_random_forest_cv_n_b
+
+# final_random_forest_cv_n_b$resample               to get info on the accuracy of each fold of each repetition
+```
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+################ selected_naive_g: Random Forest reprocessing ##########################
+
+# I need to put this dataframe in the right shape: I need to transpose it (so to have the predictors on the columns) and to add an additional column,
+# containing the labels
+
+library("randomForest")
+set.seed(7)
+selected_naive_g_trasposed <- t(selected_naive_g)
+dim(selected_naive_g_trasposed)                                                                  # Ok, it has been transposed
+labels_n_g <- factor(c(rep("Naive",59), rep("IFNg",41)))
+labelled_selected_naive_g_trasposed <- cbind(as.data.frame(selected_naive_g_trasposed), labels_n_g)                # The last column is the label column!
+colnames(labelled_selected_naive_g_trasposed)[ncol(labelled_selected_naive_g_trasposed)] <- "labels_column_n_g"
+dim(labelled_selected_naive_g_trasposed)                                                                           # In fact there is an additional column
+
+####################### selected_naive_g: Random Forest whole dataset fit #####################################
+
+# In random forest we should choose ntree and mtry by CV, but we were instructed to use the default value for mtry. A value of ntree = 50 was decided by me, in order for the function to generate a decent plot of the error in function of the number of trees. So we can consider the parameter selection step done and fit the best model on the whole dataset.
+
+library("randomForest")
+set.seed(7)
+rf_naive_g <- randomForest(labels_column_n_g ~., data = labelled_selected_naive_g_trasposed, ntree = 50)
+rf_naive_g
+plot(rf_naive_g, main = "naive - IFN gamma")
+plot(sort(rf_naive_g$importance, decreasing=TRUE))
+
+################ selected_naive_g: Random Forest multi CV run ##########################
+
+# We now wish to get an estimation the performance of the method, in order to being able to compare it to the others. We can do such by computing a cross validation error. This cross validation error will be actually computed multiple (10) times, in order to be able to compute mean and standard deviations of these cross validation errors. It is important to notice that while this cross validation explores internally different values for the parameters, it is not used for parameter selection, but only for general model evaluation. Parameter selection must be performed separately, and as discussed above, in the random forest case it is not necessary. The repeated cross validation loops internally across mtry, not across ntree, so we can just fix ntree.
+
+library("caret")
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 10, savePredictions = TRUE)
+metric <- "Accuracy"
+final_random_forest_cv_n_g <- train(labels_column_n_g ~., data=labelled_selected_naive_g_trasposed, method="rf", ntree = 50, metric=metric, trControl=control)
+final_random_forest_cv_n_g
+
+# final_random_forest_cv_n_g$resample               to get info on the accuracy of each fold of each repetition
+```
+
+## Supervised Learning: Linear Discriminant Analysis
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+################ selected_naive_b ##########################
+
+# In this case there are no parameters to tune, so we can go directly to the whole dataset fit and then to the CV. As did for random forest, we will repeat the cross validation 10 times, each time computing a single mean classification error (cross validation error) computed form the errors generated in each fold validation. We repeat it 10 times so to not have a single cross validation error, so to compute mean and standard deviations of these cross validation errors. 
+
+################# selected_naive_b: LDA whole dataset fit ####################
+
+library("MASS")
+set.seed(10)
+lda_naive_b <- lda(labels_column_n_b~., data=labelled_selected_naive_b_trasposed)
+lda_naive_b
+plot(lda_naive_b)
+
+################# selected_naive_b: LDA multi CV ##########################
+
+library("caret")
+library("e1071")
+set.seed(10)
+control <- trainControl(method="repeatedcv", number=10, repeats = 10)                     
+metric <- "Accuracy"
+lda_cv_n_b <- train(labels_column_n_b~., data=labelled_selected_naive_b_trasposed, method="lda", metric=metric, trControl=control)
+lda_cv_n_b
+
+```
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+################ selected_naive_g ########################## 
+
+# In this case there are no parameters to tune, so we can go directly to the whole dataset fit and then to the CV. As did for random forest, we will repeat the cross validation 10 times, each time computing a single mean classification error (cross validation error) computed form the errors generated in each fold validation. We repeat it 10 times so to not have a single cross validation error, so to compute mean and standard deviations of these cross validation errors. 
+
+################# selected_naive_b: LDA whole dataset fit ####################
+
+library("MASS")
+set.seed(10)
+lda_naive_g <- lda(labels_column_n_g~., data=labelled_selected_naive_g_trasposed)
+lda_naive_g
+plot(lda_naive_g)
+
+################# selected_naive_b: LDA multi CV ##########################
+
+library("caret")
+library("e1071")
+set.seed(10)
+control <- trainControl(method="repeatedcv", number=10, repeats = 10)         
+metric <- "Accuracy"
+lda_cv_n_g <- train(labels_column_n_g~., data=labelled_selected_naive_g_trasposed , method="lda", metric=metric, trControl=control)
+lda_cv_n_g
+
+```
+
+## Supervised Learning: Lasso (logistic regression with Lasso constrain)
+
+While working with LASSO regression, in principle we don't have to rely on the feature selection step, since LASSO itself is a sort of feature selection step. The problem is that if the original dataframe that we input in LASSO is too big, a protection stack overflow will be raised. For this reasons, I decided to actually run LASSO with the dataframes selected_naive_g and selected_naive_b that I got after the t - test feature selection. The model in R actually contains two parameters: lambda (Lagrange multiplier, weight given to the absolute value constrain) and alpha, which measures the blend between lasso and a mixed ridge - lasso regression, also called Elastic net regression. Since we want a purely Lasso regression, we will keep alpha = 1.
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+################ data_naive_b: 10FCV for lambda selection ########################## 
+
+library("glmnet")
+library('caret')
+set.seed(10)
+dim(labelled_selected_naive_b_trasposed)
+labelled_selected_naive_b_trasposed_matrix <- model.matrix(labels_column_n_b ~ ., data = labelled_selected_naive_b_trasposed)[, -1]   # LASSO needs matrix!
+lasso_paramsel_n_b <- cv.glmnet(labelled_selected_naive_b_trasposed_matrix, labels_n_b, alpha = 1, standardize=FALSE, family="binomial")
+plot(lasso_paramsel_n_b)
+bestlam_lasso_n_b <- lasso_paramsel_n_b$lambda.min
+bestlam_lasso_n_b
+
+################ data_naive_b: whole dataset fit ########################## 
+
+lasso_n_b <- glmnet(labelled_selected_naive_b_trasposed_matrix, labels_n_b, alpha = 1, lambda = bestlam_lasso_n_b, standardize=FALSE, family="binomial")
+plot(lasso_n_b, xvar = 'lambda', label=TRUE)
+
+################ data_naive_b: LASSO multi CV ##########################
+
+control <- trainControl(method="repeatedcv", number=10, repeats = 10)
+metric <- "Accuracy"
+final_lasso_cv_n_b <- train(labels_column_n_b~., data=labelled_selected_naive_b_trasposed, method="glmnet", family = "binomial", trControl = control, metric = metric)
+final_lasso_cv_n_b
+
+```
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+################ data_naive_g: 10FCV for lambda selection ########################## 
+
+library("glmnet")
+set.seed(10)
+dim(labelled_selected_naive_g_trasposed)
+labelled_selected_naive_g_trasposed_matrix <- model.matrix(labels_column_n_g ~ ., data = labelled_selected_naive_g_trasposed)[, -1]   # LASSO needs matrix!
+lasso_paramsel_n_g <- cv.glmnet(labelled_selected_naive_g_trasposed_matrix, labels_n_g, alpha = 1, standardize=FALSE, family="binomial")
+plot(lasso_paramsel_n_g)
+bestlam_lasso_n_g <- lasso_paramsel_n_g$lambda.min
+bestlam_lasso_n_g
+
+################ data_naive_g: whole dataset fit ########################## 
+
+lasso_n_g <- glmnet(labelled_selected_naive_g_trasposed_matrix, labels_n_g, alpha = 1, lambda = bestlam_lasso_n_g, standardize=FALSE, family="binomial")
+plot(lasso_n_g, xvar = 'lambda', label=TRUE)
+
+################ data_naive_b: LASSO multi CV ##########################
+
+control <- trainControl(method="repeatedcv", number=10, repeats = 10)
+metric <- "Accuracy"
+final_lasso_cv_n_g <- train(labels_column_n_g~., data=labelled_selected_naive_g_trasposed, method="glmnet", family = "binomial", trControl = control, metric = metric)
+final_lasso_cv_n_g
+
+```
+
+## Supervised Learning: SCUDO
+
+The model comparison should be between the three above + SCUDO, so you have to move the blocks above below and include the result of classification with SCUDO. SCUDO should work, as seen for all the other classification methods, with genes selected via t test.
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+####################### data_naive_b: 10FCV for nTop & nBottom selection #################################
+
+# SCUDO requires a parameter estimation step for estimating the best value for nTop & nBottom. We can perform this by using caret train CV implementation of SCUDO. Important: SCUDO wants the unlabelled data as x. 
+
+library("caret")
+library("rScudo")
+library("igraph")
+set.seed(10)
+
+scudo_model <- scudoModel(nTop = c(seq(250, 500, by = 50)), nBottom = c(seq(250, 500, by = 50)), N = 0.1)     # Set to the minimum for which this is working. 
+control <- trainControl(method = "cv", number = 5, summaryFunction = caret::multiClassSummary)
+scudo_paramsel_n_b <- train(x = selected_naive_b_trasposed, y = labels_n_b, method = scudo_model, trControl = control)
+scudo_paramsel_n_b
+
+# From the output: the final values used for the model were nTop = 250, nBottom = 250. We can use these to build a best model. We can then fit the best model to the full dataset to get some interesting insight out, and then perform a multi - CV in order to compare this model to the others. 
+
+####################### data_naive_b: best SCUDO train - test fit for visualization #################################
+
+scudo_n_b <- scudoTrain(selected_naive_b, groups = labels_n_b, nTop = 250, nBottom = 250)
+scudo_n_b
+
+# generate and plot map of training samples
+scudo_net_n_b <- scudoNetwork(scudo_n_b, N = 0.5)       # With 0.2 and 0.3 we get two unconnected graph and it is impossible for igraph to draw clusters
+scudoPlot(scudo_net_n_b, vertex.label = NA)
+
+# identify clusters on map
+scudo_clust_n_b <- igraph::cluster_spinglass(scudo_net_n_b, spins = 2)
+plot(scudo_clust_n_b, scudo_net_n_b, vertex.label = NA)
+
+####################### data_naive_b: SCUDO multi-CV #################################
+
+scudo_model <- scudoModel(nTop = 250, nBottom = 250, N = 0.10)
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 10, summaryFunction = caret::multiClassSummary)
+metric = 'Accuracy'
+final_scudo_cv_n_b <- train(labels_column_n_b~., data=labelled_selected_naive_b_trasposed, method= scudo_model, trControl = control, metric = metric)
+final_scudo_cv_n_b$resample
+
+```
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+####################### data_naive_g: 10FCV for nTop & nBottom selection #################################
+
+# SCUDO requires a parameter estimation step for estimating the best value for nTop & nBottom. We can perform this by using caret train CV implementation of SCUDO. Important: SCUDO wants the unlabelled data as x. 
+
+library("caret")
+library("rScudo")
+library("igraph")
+set.seed(10)
+
+scudo_model <- scudoModel(nTop = c(seq(250, 500, by = 50)), nBottom = c(seq(250, 500, by = 50)), N = 0.1)                 # Set to the minimum for which this is working. 
+control <- trainControl(method = "cv", number = 5, summaryFunction = caret::multiClassSummary)
+scudo_paramsel_n_g <- train(x = selected_naive_g_trasposed, y = labels_n_g, method = scudo_model, trControl = control)
+scudo_paramsel_n_g
+
+# From the output: the final values used for the model were nTop = 250, nBottom = 250. We can use these to build a best model. We can then fit the best model to the full dataset to get some interesting insight out, and then perform a multi - CV in order to compare this model to the others. 
+
+####################### data_naive_g: best SCUDO train - test fit for visualization #################################
+
+scudo_n_g <- scudoTrain(selected_naive_g, groups = labels_n_g, nTop = 250, nBottom = 250)
+scudo_n_g
+
+# generate and plot map of training samples
+scudo_net_n_g <- scudoNetwork(scudo_n_g, N = 0.6)                  # With other values we get two unconnected graph and it is impossible for igraph to draw clusters
+scudoPlot(scudo_net_n_g, vertex.label = NA)
+
+# identify clusters on map
+scudo_clust_n_g <- igraph::cluster_spinglass(scudo_net_n_g, spins = 2)
+plot(scudo_clust_n_g, scudo_net_n_g, vertex.label = NA)
+
+####################### data_naive_g: SCUDO multi-CV #################################
+
+scudo_model <- scudoModel(nTop = 250, nBottom = 250, N = 0.20)
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 10, summaryFunction = caret::multiClassSummary)
+metric = 'Accuracy'
+final_scudo_cv_n_g <- train(labels_column_n_g~., data=labelled_selected_naive_g_trasposed, method= scudo_model, trControl = control, metric = metric)
+final_scudo_cv_n_g
+
+```
+
+## Final Comparison of Supervised Learning Methods
+
+Each time we found the best model, we performed a 10 fold cross validation on the whole data, repeated 10 times. We can plot, for each of the supervised learning techniques, these 10 cross validation errors, in order to observe which method has the less error and for which method the variance of the cross validation errors is minimized.
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+################### Final results: naive - IFNb ###########################
+
+results <- resamples(list(RF=final_random_forest_cv_n_b, LDA=lda_cv_n_b, LASSO = final_lasso_cv_n_b, SCUDO = final_scudo_cv_n_b))
+ggplot(results) + labs(y = "Accuracy")
+
+```
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+################### Final results: naive - IFNg ###########################
+
+results <- resamples(list(RF=final_random_forest_cv_n_g, LDA=lda_cv_n_g, LASSO = final_lasso_cv_n_g, SCUDO = final_scudo_cv_n_g))
+ggplot(results) + labs(y = "Accuracy")
+
+```
+
+The strategy followed above for all supervised classification methods was the following: multi - CV to allow for comparison, parameter estimation (when needed) and whole dataset fit. This is exactly what we would need if we were to compare and choose among different models: we would have to compare the performance all of them with a nested CV, that allows us to choose the best performing model but not to choose the best parameter set; we would then need to isolate the winning model and perform parameter selection to find the best parameter set, and then we would need to fit the winning model with the best parameter set to the whole dataframe, in order for it to be ready to predict some new data, and also in order to output some statistics on the fit (such as the error - ntree plots for random forest and the plots of lda). Above we did all of this but in a different order, starting from the parameter estimation (when needed), going through the whole dataframe fit and then using a multi - CV strategy to get an estimate of the performance of the model. Notice that we did the parameter estimation and whole dataset fit also for the non - winning models, to get the aforementioned statistics on the fit.
+
+From the results above we can conclude that the four methods performed exactly the same, all of them were perfect. We choose RF as the reference model for its ease to perform feature selection via the Importance variable, as plotted above in the random forest classification section. We repost below the results of the whole dataset fit for random forest (since the parameter estimation step was not performed in random forest, given that we used the default mtry and ntree = 50). We can also generate a ROC curve with the winning method (random forest), by fitting it only to a subset of the data and predicting on the left out.
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+####################### selected_naive_b: Random Forest whole dataset fit REPOST #####################################
+
+library("randomForest")
+set.seed(10)
+rf_naive_b <- randomForest(labels_column_n_b ~., data = labelled_selected_naive_b_trasposed, ntree = 50)
+rf_naive_b
+plot(rf_naive_b)
+plot(sort(rf_naive_b$importance, decreasing=TRUE), xlab = 'index', ylab = 'importance score')
+
+####################### Random Forest: ROC curve data_naive_b ############################
+
+library("randomForest")
+library("ROCR")
+set.seed(10)
+dim(labelled_selected_naive_b_trasposed)
+n <- 60                                                                        # Of the 92 rows, 60 rows will be sampled for training, the remaining for testing
+train_indexes_n_b <- sample(nrow(labelled_selected_naive_b_trasposed), n)
+labelled_selected_naive_b_trasposed_train <- labelled_selected_naive_b_trasposed[train_indexes_n_b, ]
+labelled_selected_naive_b_trasposed_test <- labelled_selected_naive_b_trasposed[-train_indexes_n_b, ]
+
+# We need to fit the random forest with default mtry and 50 trees on the training data, and then predict on the test data. 
+
+partial_fit_rf_n_b <- randomForest(labels_column_n_b ~., data = labelled_selected_naive_b_trasposed_train, ntree = 50)
+predictions_rf_n_b <- predict(partial_fit_rf_n_b, newdata = labelled_selected_naive_b_trasposed_test, type = 'prob')[,2]
+
+# first, we need to create a "prediction" object
+prediction_object_rf_n_b <- ROCR::prediction(predictions_rf_n_b, labelled_selected_naive_b_trasposed_test$labels_column_n_b)
+
+# then we need a "performance" object
+performance_object_rf_n_b <- ROCR::performance(prediction_object_rf_n_b, "tpr", "fpr")
+
+# now the plot!
+plot(performance_object_rf_n_b)
+
+abline(0, 1, col = "gray", lty = 2)
+
+```
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+####################### selected_naive_g: Random Forest whole dataset fit REPOST #####################################
+
+library("randomForest")
+set.seed(12)
+rf_naive_g <- randomForest(labels_column_n_g ~., data = labelled_selected_naive_g_trasposed, ntree = 50)
+rf_naive_g
+plot(rf_naive_g)
+plot(sort(rf_naive_g$importance, decreasing=TRUE), xlab = 'index', ylab = 'importance score')
+
+####################### Random Forest: ROC curve data_naive_b ############################
+
+library("randomForest")
+library("ROCR")
+set.seed(10)
+dim(labelled_selected_naive_g_trasposed)
+n <- 60                                                                        # Of the 92 rows, 60 rows will be sampled for training, the remaining for testing
+train_indexes_n_g <- sample(nrow(labelled_selected_naive_g_trasposed), n)
+labelled_selected_naive_g_trasposed_train <- labelled_selected_naive_g_trasposed[train_indexes_n_g, ]
+labelled_selected_naive_g_trasposed_test <- labelled_selected_naive_g_trasposed[-train_indexes_n_g, ]
+
+# We need to fit the random forest with default mtry and 50 trees on the training data, and then predict on the test data. 
+
+partial_fit_rf_n_g <- randomForest(labels_column_n_g ~., data = labelled_selected_naive_g_trasposed_train, ntree = 50)
+predictions_rf_n_g <- predict(partial_fit_rf_n_g, newdata = labelled_selected_naive_g_trasposed_test, type = 'prob')[,2]
+
+# first, we need to create a "prediction" object
+prediction_object_rf_n_g <- ROCR::prediction(predictions_rf_n_g, labelled_selected_naive_g_trasposed_test$labels_column_n_g)
+
+# then we need a "performance" object
+performance_object_rf_n_g <- ROCR::performance(prediction_object_rf_n_g, "tpr", "fpr")
+
+# now the plot!
+plot(performance_object_rf_n_g)
+
+abline(0, 1, col = "gray", lty = 2)
+
+```
+
+## Functional Analysis - DAVID
+
+We start by extracting the most important genes from the winning model, which is random forest. We will perform such extraction on the basis of the Importance variable computed by the random forest. Then we need to connect each gene with its GEO terms, creating a list of terms for each gene. Finally, we will need to derive which of these terms, across all lists, is present a number of times statistically different than the one expected by starting with a random list of genes. We can do this using a Fisher test. The list building and Fisher testing, together with its correction for the high number of testings, will be automatically performed by an online tool (David). Firstly, let's sort all genes from the random forest Importance plot:
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# experimental_ids_n_b <- rownames(rf_naive_b$importance)
+# top_all_n_b <- experimental_ids_n_b[order(rf_naive_b$importance, decreasing=TRUE)]
+# write.csv(top_all_n_b, file = "top_all_n_b.txt", quote=FALSE, row.names = FALSE, col.names=FALSE)
+
+```
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# experimental_ids_n_g <- rownames(rf_naive_g$importance)
+# top_all_n_g <- experimental_ids_n_g[order(rf_naive_g$importance, decreasing=TRUE)]
+# write.csv(top_all_n_g, file = "top_all_n_g.txt", quote=FALSE, row.names = FALSE, col.names=FALSE)
+
+```
+
+DAVID was tested with a different number of genes. 400 seemed to be the number able to generate high Benjamini score, so it was decided to perform the subsequent analyses with the top 400 genes from the two datasets, according to the importance score. The top 400 CSVs where modified so to remove the transcript identifier (the point and the number after the points), since David didn't have knowledge about individual transcripts and was identifying very few genes. This way we will work with gene identifiers, not anymore with transcript identifiers. The modified files were then uploaded to David, choosing ENSEMBL_Gene_ID as identifier. We choose as enrichment the following: no diseases, no functional annotation, leave gene ontology, no interactions, for pathways only reactome and KEGG, no protein domains, no tissue expression, no anything else. So only the default gene ontology and reactome + KEGG for the pathways. The result is a list of terms ranked for adjusted p value. I downloaded the file for each gene list, in CSV form, and I loaded them with the code below.
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+david_n_b <- read.csv2('DAVID_out_n_b.csv', sep = "\t")
+head(david_n_b[, c('Term', 'Benjamini')], 10)         # Show only some columns and the first 10 rows
+
+david_n_g <- read.csv2('DAVID_out_n_g.csv', sep = "\t")
+head(david_n_g[, c('Term', 'Benjamini')], 10)         # Show only some columns and the first 10 rows
+
+```
+
+
+
+## Functional Analysis - gPROFILER
+
+```{r, echo=FALSE, fig.width=8, fig.height=8, fig.align="center"}
+
+############################### gPROFILER: Naive - IFNb ############################################################################
+# I need to load the list of top 200 genes, so the list where the numbers encoding the transcripts were removed. 
+
+top_400_n_b_notrans <- read.csv('top_400_n_b_notrans.txt')
+top_400_n_b_notrans <- as.vector(top_400_n_b_notrans)
+
+library(gprofiler2)
+gost_res_n_b <- gost(query = top_400_n_b_notrans, organism = "hsapiens", ordered_query = FALSE, multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, measure_underrepresentation = FALSE, evcodes = FALSE, user_threshold = 0.05, correction_method = "gSCS", domain_scope = "annotated", custom_bg = NULL, numeric_ns = "", sources = NULL, as_short_link = FALSE)
+
+gost_res_n_b_sorted <- gost_res_n_b$result[order(gost_res_n_b$result$p_value), ]      # Sort according to p - value (this is actually the adjusted p value, from the help)
+
+rownames(gost_res_n_b_sorted) <- NULL
+
+head(gost_res_n_b_sorted[, c('term_id', 'term_name', 'p_value')], 10)       # Show only some columns and the first 10 rows
+
+# visualize results using a Manhattan plot
+gostplot(gost_res_n_b, capped = TRUE, interactive = TRUE)
+
+# Publication quality plot + table of first 10 interesting terms/pathways (according to p value, that in this case is an adjusted p value)
+p_n_b <- gostplot(gost_res_n_b, capped = TRUE, interactive = FALSE)
+publish_gostplot(p_n_b, highlight_terms = c("GO:1903047", "GO:0022402", "GO:0000278","GO:0007049", "GO:0051301", "GO:0007059", "GO:0051726", "GO:0044770", "GO:0000070", "GO:0010564"), width = NA, height = NA, filename = NULL)
+
+```
+
+```{r, echo=FALSE, fig.width=10, fig.height=8}
+
+############################### gPROFILER: Naive - IFNg ############################################################################
+# I need to load the list of top 200 genes, so the list where the numbers encoding the transcripts were removed. 
+
+top_400_n_g_notrans <- read.csv('top_400_n_g_notrans.txt')
+top_400_n_g_notrans <- as.vector(top_400_n_g_notrans)
+
+library(gprofiler2)
+gost_res_n_g <- gost(query = top_400_n_g_notrans, organism = "hsapiens", ordered_query = FALSE, multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, measure_underrepresentation = FALSE, evcodes = FALSE, user_threshold = 0.05, correction_method = "gSCS", domain_scope = "annotated", custom_bg = NULL, numeric_ns = "", sources = NULL, as_short_link = FALSE)
+
+gost_res_n_g_sorted <- gost_res_n_g$result[order(gost_res_n_g$result$p_value), ]      # Sort according to p - value (this is actually the adjusted p value, from the help)
+
+rownames(gost_res_n_g_sorted) <-NULL
+
+head(gost_res_n_g_sorted[, c('term_id', 'term_name', 'p_value')], 10)       # Show only some columns and the first 10 rows
+
+# visualize results using a Manhattan plot
+gostplot(gost_res_n_g, capped = TRUE, interactive = TRUE)
+
+# Publication quality plot + table of first 10 interesting terms/pathways (according to p value, that in this case is an adjusted p value)
+p_n_g <- gostplot(gost_res_n_g, capped = TRUE, interactive = FALSE)
+publish_gostplot(p_n_g, highlight_terms = c("GO:0005737", "GO:1903561", "GO:0065010","GO:0043230", "GO:0070062", "GO:0031982", "GO:0005515", "GO:0007052", "REAC:R-HSA-141424", "REAC:R-HSA-141444"), filename = NULL)
+
+```
+
+# NETWORK BASED ANALYSIS - PathfindR
+
+```{r, echo=FALSE, fig.width=3.7, fig.height=3.7, fig.align="center"}
+
+# PathfindR requires as input a dataset of important genes with their p values. We have already extracted the firsts form the importance plot of random forest, while the second can be extracted form the results of the t - Test. These can be found in the dataframe variables tt_naive_b and tt_naive_g
+
+top_400_n_b_pvalues <- c()
+
+top_400_n_b <- read.csv2('top_400_n_b', header = F)
+
+for (geneid in top_400_n_b$V1) {
+  for (name in rownames(tt_naive_b)) {
+    if (geneid == name) {
+      top_400_n_b_pvalues <- append(top_400_n_b_pvalues, tt_naive_b[name, 3])
+    }
+  }
+}
+
+top_400_n_g_pvalues <- c()
+
+top_400_n_g <- read.csv2('top_400_n_g', header = F)
+
+for (geneid2 in top_400_n_g$V1) {
+  for (name2 in rownames(tt_naive_g)) {
+    if (geneid2 == name2) {
+      top_400_n_g_pvalues <- append(top_400_n_g_pvalues, tt_naive_g[name2, 3])
+    }
+  }
+}
+
+# Now we can build the dataset having the important genes and their p - values. We won't be using the variables top_400_n_b and top_400_n_g to do so: this is because pathfinder wants entries in gene symbol form, not transcript. We can use the files top_400_n_b_notrans and top_400_n_g_notrans to gain access to the gene IDs, and we can use these in combination with the biotools.fr/human/ensembl_symbol_converter website to get the gene symbols from the enseble gene IDs. Two new files, top_400_n_b_notrans_genesymbols.txt and top_400_n_g_notrans_genesymbols.txt, were created for this purpose. We can load them and use them as the first column. 
+
+genesymbols_n_b <- read.csv2('top_400_n_b_notrans_genesymbols.txt', header = F)
+genesymbols_n_g <- read.csv2('top_400_n_g_notrans_genesymbols.txt', header = F)
+
+path_data_n_b <- data.frame('top_400_n_b_genesymbols' = genesymbols_n_b, 'top_400_n_b_pvalues' = top_400_n_b_pvalues)
+path_data_n_g <- data.frame('top_400_n_g_genesymbols' = genesymbols_n_g, 'top_400_n_g_pvalues' = top_400_n_g_pvalues)
+
+```
+
+At this point we have everything that we need to start the actual Network Based Analysis with PathfindR. As usual, we will divide our analyses according to the comparison between naive and IFNb, naive and IFNg.
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+################# Network Based Analysis with pathfindR: naive - IFNb ################################
+
+library("KEGGREST")
+library("KEGGgraph")
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library("pathfindR")
+
+# algorithm is non deterministic, so better allow it to perform multiple times and average results. 
+path_results_n_b <- run_pathfindR(path_data_n_b, iterations = 5)                                                    # with 10 the computer dies
+head(path_results_n_b[, c('Term_Description', 'lowest_p', 'highest_p')], 10)                                  # show only some columns and the first 10 rows
+
+# bubble chart displaying the enrichment results
+enrichment_chart(path_results_n_b, top_terms = 10, plot_by_cluster = FALSE, num_bubbles = 4, even_breaks = TRUE)
+
+## cluster enriched terms
+path_cluster_n_b <- cluster_enriched_terms(path_results_n_b)
+
+## term-gene graph of top 10 terms
+term_gene_graph(path_cluster_n_b)
+
+```
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+################# Network Based Analysis with pathfindR: naive - IFNg ################################
+
+library("KEGGREST")
+library("KEGGgraph")
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library("pathfindR")
+
+# algorithm is non deterministic, so better allow it to perform multiple times and average results. 
+path_results_n_g <- run_pathfindR(path_data_n_g, iterations = 5)                                               # with 10 the computer dies
+head(path_results_n_g[, c('Term_Description', 'lowest_p', 'highest_p')], 10)                             # show only some columns and the first 10 rows
+
+# bubble chart displaying the enrichment results
+enrichment_chart(path_results_n_g, top_terms = 10, plot_by_cluster = FALSE, num_bubbles = 4, even_breaks = TRUE)
+
+## cluster enriched terms
+path_cluster_n_g <- cluster_enriched_terms(path_results_n_g)
+
+## term-gene graph of top 10 terms
+term_gene_graph(path_cluster_n_g)
+
+```
+
+# NETWORK BASED ANALYSIS - STRING
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+######################## STRING: Naive - IFNb and Naive - IFNg ######################################
+# String is an online tool for gene network enrichment and functional analysis. Setting used were: experiments as a source of iteractions, highest confidence, no more than 20 interactors in the first shell, hide disconnected nodes in the network. The functional analysis is then performed by STRING on the expended network. The images generated were exported, and so the results for both comparisons. The results were loaded here and sorted according to the false discovery rate. 
+
+string_n_b <- read.csv2('string_n_b.tsv', sep = '\t')     # Top entries for false discovery rate are already at the top of the dataframe, no need sorting
+string_n_g <- read.csv2('string_n_g_manual.csv', sep = ',')     # Here instead I need to sort, but the sorter SUCKS with the scientific notation, so I built the 
+                                                                 # database with the to 10 entries manually and loaded it. 
+
+head(string_n_b[, c('term.description', 'false.discovery.rate')], 10)
+head(string_n_g[, c('term.description', 'false.discovery.rate')], 10)
+
+```
+
+# NETWORK BASED ANALYSIS - EnrichNet
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+######################## EnrichNet: Naive - IFNb ######################################
+# The enrichnet analysis was repeated with three different databases: kegg, reactome and go. The results were appended in a single CSV, which was loaded and sorted for XD score.
+
+enrichnet_n_b <- read.csv('enrichnet_n_b.txt', sep = '\t')
+enrichnet_n_b_sorted <- enrichnet_n_b[rev(order(enrichnet_n_b$XD.score)), ]
+row.names(enrichnet_n_b_sorted) <- NULL
+head(enrichnet_n_b_sorted[, c('Annotation..pathway.process.', 'XD.score', 'Pathway.size', 'Overlap.size')], 10)
+
+# Across all 5 strategies for Naive-IFNb: very big support for cell division, cell cycle, mitotic cell cycle and chromosomal segregation. Ribosome and complement also seems to be involved. It was decided, for what concerns Naive - IFNb, to produce the network for the entries G2 PHASE OF MITOTIC CELL CYCLE, MITOTIC SISTER CHROMATID SEGREGATION, INITIAL TRIGGERING OF COMPLEMENT and RIBOSOMAL LARG SUBUNIT BIOGENESIS, given that these terms have been reported also by DAVID, gProfiler and STRING. It could be interesting to compare the whole networks generated by STRING and Pathfinder to the many ones that I am considering for EnrichNET.
+
+```
+
+```{r, echo=FALSE, fig.width=7, fig.height=7, fig.align="center"}
+
+######################## EnrichNet: Naive - IFNg ######################################
+# The enrichnet analysis was repeated with three different databases: kegg, reactome and go. The results were appended in a single CSV, which was loaded and sorted for XD score.
+
+enrichnet_n_g <- read.csv('enrichnet_n_g.txt', sep = '\t')
+enrichnet_n_g_sorted <- enrichnet_n_g[rev(order(enrichnet_n_g$XD.score)), ]
+row.names(enrichnet_n_g_sorted) <- NULL
+head(enrichnet_n_g_sorted[, c('Annotation..pathway.process.', 'XD.score', 'Pathway.size', 'Overlap.size')], 10)
+
+# It was decided, for what concerns Naive - IFNb, to produce the network for the entries pentose-phosphate shunt and Pentose phosphate pathway, since these are the only ones for which the other methods give support. 
+
+# Across all 5 strategies for Naive-IFNg: very big support for Amplification of signal from unattached kinetochores, mitotic spindle organization, and ribosome.  It was decided, for what concerns Naive - IFNb, to produce the network for the entries MITOTIC SPINDLE ORGANIZATION and RIBOSOMAL LARGE SUBUNIT BIOGENESIS. It could be interesting to compare the whole networks generated by STRING and Pathfinder to the many ones that I am considering for EnrichNET.
+
+```
